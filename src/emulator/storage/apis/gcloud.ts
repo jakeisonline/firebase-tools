@@ -13,10 +13,11 @@ import { EmulatorLogger } from "../../emulatorLogger";
 import { GetObjectResponse, ListObjectsResponse } from "../files";
 import type { Request, Response } from "express";
 import { parseObjectUploadMultipartRequest } from "../multipart";
-import { Upload, UploadNotActiveError } from "../upload";
+import { Upload, UploadNotActiveError, UploadStatus } from "../upload";
 import { ForbiddenError, NotFoundError } from "../errors";
 import { reqBodyToBuffer } from "../../shared/request";
 import type { Query } from "express-serve-static-core";
+import { logger } from "../../../logger";
 
 export function createCloudEndpoints(emulator: StorageEmulator): Router {
   // eslint-disable-next-line new-cap
@@ -190,8 +191,100 @@ export function createCloudEndpoints(emulator: StorageEmulator): Router {
     const uploadId = req.query.upload_id.toString();
     let upload: Upload;
     try {
-      uploadService.continueResumableUpload(uploadId, await reqBodyToBuffer(req));
-      upload = uploadService.finalizeResumableUpload(uploadId);
+      upload = uploadService.getResumableUpload(uploadId);
+      interface ContentRange {
+        start: number;
+        end: number;
+        total?: number;
+      }
+
+      const contentLength = req.headers["content-length"];
+      const contentRange = req.headers["content-range"];
+
+      // Query status upload (Content-Length = 0, no Content-Range)
+      if (contentLength === "0" && !contentRange) {
+        const upload = uploadService.getResumableUpload(uploadId);
+        if (upload.size > 0) {
+          res.setHeader("Range", `bytes=0-${upload.size - 1}`);
+        }
+        res.status(308).send();
+        return;
+      }
+
+      // Data upload (Content-Length > 0)
+      if (contentLength && contentLength !== "0") {
+        const data = await reqBodyToBuffer(req);
+
+        if (contentRange) {
+          let parsedRange: ContentRange | null = null;
+          try {
+            const match = contentRange.match(/^bytes\s+(\d+)-(\d+)(?:\/(\d+|\*))?$/);
+            if (match) {
+              const start = parseInt(match[1], 10);
+              const end = parseInt(match[2], 10);
+              const total =
+                match[3] === "*" ? undefined : match[3] ? parseInt(match[3], 10) : undefined;
+
+              if (start >= 0 && end >= start && (total === undefined || total >= end + 1)) {
+                parsedRange = { start, end, total };
+              }
+            }
+          } catch {
+            logger.error(`Invalid Content-Range header: ${contentRange}`);
+            res.status(400).send("Invalid Content-Range header");
+            return;
+          }
+
+          if (!parsedRange) {
+            logger.error(`Failed to parse Content-Range header: ${contentRange}`);
+            res.status(400).send("Invalid Content-Range header format");
+            return;
+          }
+
+          // Validate chunk position - must start where the upload currently is
+          if (parsedRange.start !== upload.size) {
+            logger.error(`Chunk starts at ${parsedRange.start} but upload is at ${upload.size}`);
+            res.status(400).send("Invalid chunk position - chunks must be uploaded sequentially");
+            return;
+          }
+
+          // Validate chunk size matches the data received
+          const expectedChunkSize = parsedRange.end - parsedRange.start + 1;
+          if (data.byteLength !== expectedChunkSize) {
+            logger.error(
+              `Chunk size mismatch: expected ${expectedChunkSize} bytes, got ${data.byteLength}`,
+            );
+            res.status(400).send("Chunk size mismatch");
+            return;
+          }
+
+          const updatedUpload = uploadService.continueResumableUpload(uploadId, data);
+
+          // Check completion based on range total
+          const isComplete =
+            parsedRange.total !== undefined ? updatedUpload.size >= parsedRange.total : false; // Only complete if we have a total and reached it
+
+          if (isComplete) {
+            const finalizedUpload = uploadService.finalizeResumableUpload(uploadId);
+            const metadata = await adminStorageLayer.uploadObject(finalizedUpload);
+            res.status(201).json(new CloudStorageObjectMetadata(metadata));
+            return;
+          }
+
+          // Upload incomplete, return resume status with current progress
+          res.setHeader("Range", `bytes=0-${updatedUpload.size - 1}/${parsedRange.total || "*"}`);
+          res.status(308).send(); // Resume Incomplete
+          return;
+        } else {
+          // For single chunk uploads without Content-Range, assume completion as the emulator
+          // does not support partial uploads
+          uploadService.continueResumableUpload(uploadId, data);
+          const finalizedUpload = uploadService.finalizeResumableUpload(uploadId);
+          const metadata = await adminStorageLayer.uploadObject(finalizedUpload);
+          res.status(201).json(new CloudStorageObjectMetadata(metadata));
+          return;
+        }
+      }
     } catch (err) {
       if (err instanceof NotFoundError) {
         return res.sendStatus(404);
@@ -200,17 +293,18 @@ export function createCloudEndpoints(emulator: StorageEmulator): Router {
       }
       throw err;
     }
+  });
 
-    let metadata: StoredFileMetadata;
-    try {
-      metadata = await adminStorageLayer.uploadObject(upload);
-    } catch (err) {
-      if (err instanceof ForbiddenError) {
-        return res.sendStatus(403);
-      }
-      throw err;
+  gcloudStorageAPI.delete("/upload/storage/v1/b/:bucketId/o", async (req, res) => {
+    if (!req.query.upload_id) {
+      res.sendStatus(400);
+      return;
     }
-    return res.json(new CloudStorageObjectMetadata(metadata));
+
+    const uploadId = req.query.upload_id.toString();
+
+    uploadService.cancelResumableUpload(uploadId);
+    return res.sendStatus(499);
   });
 
   gcloudStorageAPI.post("/b/:bucketId/o/:objectId/acl", async (req, res) => {
